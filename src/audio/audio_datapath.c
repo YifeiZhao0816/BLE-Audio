@@ -24,6 +24,7 @@
 #include "contin_array.h"
 #include "pcm_mix.h"
 #include "streamctrl.h"
+#include "processing.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(audio_datapath, CONFIG_AUDIO_DATAPATH_LOG_LEVEL);
@@ -120,7 +121,7 @@ static struct {
 
 	struct {
 		struct data_fifo *fifo;
-	} in;
+	} in; /* From I2S to BLE */
 
 	struct {
 		int16_t __aligned(sizeof(uint32_t)) fifo[MAX_FIFO_SIZE];
@@ -129,7 +130,7 @@ static struct {
 		uint32_t prod_blk_ts[FIFO_NUM_BLKS];
 		/* Statistics */
 		uint32_t total_blk_underruns;
-	} out;
+	} out; /* From BLE to I2S */
 
 	uint32_t previous_sdu_ref_us;
 	uint32_t current_pres_dly_us;
@@ -154,6 +155,9 @@ static bool tone_active;
 /* Buffer which can hold max 1 period test tone at 100 Hz */
 static uint16_t test_tone_buf[CONFIG_AUDIO_SAMPLE_RATE_HZ / 100];
 static size_t test_tone_size;
+static int temp = 0;
+
+static void log_array(int16_t* ref, int16_t* out);
 
 static void hfclkaudio_set(uint16_t freq_value)
 {
@@ -573,100 +577,144 @@ static void audio_datapath_i2s_blk_complete(uint32_t frame_start_ts, uint32_t *r
 	/********** I2S TX **********/
 	static uint8_t *tx_buf;
 
-	if (IS_ENABLED(CONFIG_STREAM_BIDIRECTIONAL) || (CONFIG_AUDIO_DEV == HEADSET)) {
-		if (tx_buf_released != NULL) {
-			/* Double buffered index */
-			uint32_t next_out_blk_idx = NEXT_IDX(ctrl_blk.out.cons_blk_idx);
+	if (tx_buf_released != NULL) {
+		/* Double buffered index */
+		uint32_t next_out_blk_idx = NEXT_IDX(ctrl_blk.out.cons_blk_idx);
 
-			if (next_out_blk_idx != ctrl_blk.out.prod_blk_idx) {
-				/* Only increment if not in underrun condition */
-				ctrl_blk.out.cons_blk_idx = next_out_blk_idx;
-				if (underrun_condition) {
-					underrun_condition = false;
-					LOG_WRN("Data received, total underruns: %d",
+		if (next_out_blk_idx != ctrl_blk.out.prod_blk_idx) {
+			/* Only increment if not in underrun condition */
+			ctrl_blk.out.cons_blk_idx = next_out_blk_idx;
+			if (underrun_condition) {
+				underrun_condition = false;
+				LOG_WRN("Data received, total underruns: %d",
+					ctrl_blk.out.total_blk_underruns);
+			}
+
+			tx_buf = (uint8_t *)&ctrl_blk.out
+					 .fifo[next_out_blk_idx * BLK_MONO_SIZE_OCTETS];
+
+		} else {
+			if (stream_state_get() == STATE_STREAMING) {
+				underrun_condition = true;
+				ctrl_blk.out.total_blk_underruns++;
+
+				if ((ctrl_blk.out.total_blk_underruns %
+				     UNDERRUN_LOG_INTERVAL_BLKS) == 0) {
+					LOG_WRN("In I2S TX underrun condition, total: %d",
 						ctrl_blk.out.total_blk_underruns);
 				}
-
-				tx_buf = (uint8_t *)&ctrl_blk.out
-						 .fifo[next_out_blk_idx * BLK_MONO_SIZE_OCTETS];
-
-			} else {
-				if (stream_state_get() == STATE_STREAMING) {
-					underrun_condition = true;
-					ctrl_blk.out.total_blk_underruns++;
-
-					if ((ctrl_blk.out.total_blk_underruns %
-					     UNDERRUN_LOG_INTERVAL_BLKS) == 0) {
-						LOG_WRN("In I2S TX underrun condition, total: %d",
-							ctrl_blk.out.total_blk_underruns);
-					}
-				}
-
-				/*
-				 * No data available in out.fifo
-				 * use alternative buffers
-				 */
-				ret = alt_buffer_get((void **)&tx_buf);
-				ERR_CHK(ret);
-
-				memset(tx_buf, 0, BLK_STEREO_SIZE_OCTETS);
 			}
 
-			if (tone_active) {
-				tone_mix(tx_buf);
-			}
+			/* No data available in out.fifo
+			 * use alternative buffers
+			 */
+			ret = alt_buffer_get((void **)&tx_buf);
+			ERR_CHK(ret);
+
+			memset(tx_buf, 0, BLK_STEREO_SIZE_OCTETS);
 		}
+
+		if (tone_active) {
+			tone_mix(tx_buf);
+		}
+
+		// TestLibrary(tx_buf, tx_buf, BLK_STEREO_SIZE_OCTETS);
+
+		/* 	
+			rx_buf: microphone I2S received samples, size = 96 bytes * 2 channels
+			Mono mic input is duplicated to both channels.
+		 	tx_buf: bluetooth received packet, size = 96 * 2. 
+		 	one channel is filled with zero. Data in two channels stored alternatively.
+		*/
+		// Test FIRFilter Design
+		// if (rx_buf_released != NULL){
+		// 	filterFIR(rx_buf_released, tx_buf, tx_buf);
+		// 	log_array(rx_buf_released, tx_buf);
+		// } else {
+		//  	int16_t* localSound;
+		//  	size_t size;
+		//  	data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &localSound, &size, K_NO_WAIT); 
+		// 	filterFIR(localSound, tx_buf, tx_buf);
+		// }
+		
+
+		// Mix remote sound with local mic input
+		// if (rx_buf_released != NULL){
+		// 	int i;
+		// 	uint16_t* temp = tx_buf;
+		// 	uint16_t* temp1 = rx_buf_released;
+		// 	for (i = 0; i < BLK_STEREO_SIZE_OCTETS/2; i++){	
+		// 		temp[i] += temp1[i];
+		// 	}
+		// }
+		// else {
+		//  	uint16_t* localSound;
+		//  	size_t size;
+		//  	data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &localSound, &size, K_NO_WAIT); 
+		// 	int i;
+		// 	uint16_t* temp = tx_buf;
+		// 	for (i = 0; i < BLK_STEREO_SIZE_OCTETS/2; i++){
+		// 		temp[i] += localSound[i];
+		// 	}
+		// }
 	}
 
 	/********** I2S RX **********/
-	static uint32_t *rx_buf;
+	uint32_t *rx_buf;
 	static int prev_ret;
 
-	if (IS_ENABLED(CONFIG_STREAM_BIDIRECTIONAL) || (CONFIG_AUDIO_DEV == GATEWAY)) {
-		/* Lock last filled buffer into message queue */
-		if (rx_buf_released != NULL) {
-			ret = data_fifo_block_lock(ctrl_blk.in.fifo, (void **)&rx_buf_released,
-						   BLOCK_SIZE_BYTES);
+	/* Lock last filled buffer into message queue */
+	if (rx_buf_released != NULL) {
+		ret = data_fifo_block_lock(ctrl_blk.in.fifo, (void **)&rx_buf_released,
+					   BLOCK_SIZE_BYTES);
 
-			ERR_CHK_MSG(ret, "Unable to lock block RX");
-		}
+		ERR_CHK_MSG(ret, "Unable to lock block RX");
+	}
 
-		/* Get new empty buffer to send to I2S HW */
-		ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf,
-							 K_NO_WAIT);
-		if (ret == 0 && prev_ret == -ENOMEM) {
-			LOG_WRN("I2S RX continuing stream");
+	/* Get new empty buffer to send to I2S HW */
+	ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf, K_NO_WAIT);
+	if (ret == 0 && prev_ret == -ENOMEM) {
+		LOG_WRN("I2S RX continuing stream");
+		prev_ret = ret;
+	}
+
+	/* If RX FIFO is filled up */
+	if (ret == -ENOMEM) {
+		void *data;
+		size_t size;
+
+		if (ret != prev_ret) {
+			LOG_WRN("I2S RX overrun. Single msg");
 			prev_ret = ret;
 		}
 
-		/* If RX FIFO is filled up */
-		if (ret == -ENOMEM) {
-			void *data;
-			size_t size;
+		ret = data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &data, &size, K_NO_WAIT);
+		ERR_CHK(ret);
 
-			if (ret != prev_ret) {
-				LOG_WRN("I2S RX overrun. Single msg");
-				prev_ret = ret;
-			}
+		data_fifo_block_free(ctrl_blk.in.fifo, &data);
 
-			ret = data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &data, &size,
-								K_NO_WAIT);
-			ERR_CHK(ret);
-
-			data_fifo_block_free(ctrl_blk.in.fifo, &data);
-
-			ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf,
-								 K_NO_WAIT);
-		}
-
-		ERR_CHK_MSG(ret, "RX failed to get block");
+		ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf,
+							 K_NO_WAIT);
 	}
+
+	ERR_CHK_MSG(ret, "RX failed to get block");
 
 	/*** Data exchange ***/
 	audio_i2s_set_next_buf(tx_buf, rx_buf);
 
 	/*** Drift compensation ***/
 	audio_datapath_drift_compensation(frame_start_ts);
+}
+
+static void log_array(int16_t* ref, int16_t* out){
+	temp++;
+	if (temp == 1000){
+		temp = 0;
+		int16_t* coef = getCoeffPtr(); 
+		LOG_WRN("input: %d %d %d %d %d %d %d %d\n", ref[0], ref[1], ref[2], ref[3], ref[4], ref[5], ref[6], ref[7]);
+		LOG_WRN("reference: %d %d %d %d %d %d %d %d\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+		LOG_WRN("error: %d %d %d %d %d %d %d %d\n", coef[0], coef[1], coef[2], coef[3], coef[4], coef[5], coef[6], coef[7]);
+	}
 }
 
 static void audio_datapath_i2s_start(void)
@@ -680,33 +728,29 @@ static void audio_datapath_i2s_start(void)
 	uint32_t *rx_buf_two = NULL;
 
 	/* TX */
-	if (IS_ENABLED(CONFIG_STREAM_BIDIRECTIONAL) || (CONFIG_AUDIO_DEV == HEADSET)) {
-		ctrl_blk.out.cons_blk_idx = PREV_IDX(ctrl_blk.out.cons_blk_idx);
-		tx_buf_one = (uint8_t *)&ctrl_blk.out
-				     .fifo[ctrl_blk.out.cons_blk_idx * BLK_STEREO_NUM_SAMPS];
+#if (CONFIG_STREAM_BIDIRECTIONAL || (CONFIG_AUDIO_DEV == HEADSET))
+	ctrl_blk.out.cons_blk_idx = PREV_IDX(ctrl_blk.out.cons_blk_idx);
+	tx_buf_one =
+		(uint8_t *)&ctrl_blk.out.fifo[ctrl_blk.out.cons_blk_idx * BLK_STEREO_NUM_SAMPS];
 
-		ctrl_blk.out.cons_blk_idx = PREV_IDX(ctrl_blk.out.cons_blk_idx);
-		tx_buf_two = (uint8_t *)&ctrl_blk.out
-				     .fifo[ctrl_blk.out.cons_blk_idx * BLK_STEREO_NUM_SAMPS];
-	}
+	ctrl_blk.out.cons_blk_idx = PREV_IDX(ctrl_blk.out.cons_blk_idx);
+	tx_buf_two =
+		(uint8_t *)&ctrl_blk.out.fifo[ctrl_blk.out.cons_blk_idx * BLK_STEREO_NUM_SAMPS];
+#endif /* (CONFIG_STREAM_BIDIRECTIONAL || (CONFIG_AUDIO_DEV == HEADSET)) */
 
 	/* RX */
-	if (IS_ENABLED(CONFIG_STREAM_BIDIRECTIONAL) || (CONFIG_AUDIO_DEV == GATEWAY)) {
-		uint32_t alloced_cnt;
-		uint32_t locked_cnt;
+	uint32_t alloced_cnt;
+	uint32_t locked_cnt;
 
-		ret = data_fifo_num_used_get(ctrl_blk.in.fifo, &alloced_cnt, &locked_cnt);
-		if (alloced_cnt || locked_cnt || ret) {
-			ERR_CHK_MSG(-ENOMEM, "Fifo is not empty!");
-		}
-
-		ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf_one,
-							 K_NO_WAIT);
-		ERR_CHK_MSG(ret, "RX failed to get block");
-		ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf_two,
-							 K_NO_WAIT);
-		ERR_CHK_MSG(ret, "RX failed to get block");
+	ret = data_fifo_num_used_get(ctrl_blk.in.fifo, &alloced_cnt, &locked_cnt);
+	if (alloced_cnt || locked_cnt || ret) {
+		ERR_CHK_MSG(-ENOMEM, "Fifo is not empty!");
 	}
+
+	ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf_one, K_NO_WAIT);
+	ERR_CHK_MSG(ret, "RX failed to get block");
+	ret = data_fifo_pointer_first_vacant_get(ctrl_blk.in.fifo, (void **)&rx_buf_two, K_NO_WAIT);
+	ERR_CHK_MSG(ret, "RX failed to get block");
 
 	/* Start I2S */
 	audio_i2s_start(tx_buf_one, rx_buf_one);
@@ -816,8 +860,7 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 					     CONFIG_AUDIO_FRAME_DURATION_US;
 			}
 		} else {
-			LOG_INF("sdu_ref_us not from consecutive frames (diff: %d us)",
-				sdu_ref_delta_us);
+			LOG_INF("sdu_ref_us not from consecutive frames");
 			sdu_ref_not_consecutive = true;
 		}
 	}
@@ -834,6 +877,7 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 	int ret;
 	size_t pcm_size;
 
+	//return data and stored them into the pointer in the struct ctrl_blk
 	ret = sw_codec_decode(buf, size, bad_frame, &ctrl_blk.decoded_data, &pcm_size);
 
 	if (ret) {
@@ -847,7 +891,6 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 	}
 
 	/*** Add audio data to FIFO buffer ***/
-
 	int32_t num_blks_in_fifo = ctrl_blk.out.prod_blk_idx - ctrl_blk.out.cons_blk_idx;
 
 	if ((num_blks_in_fifo + NUM_BLKS_IN_FRAME) > FIFO_NUM_BLKS) {
@@ -859,7 +902,17 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 
 	uint32_t out_blk_idx = ctrl_blk.out.prod_blk_idx;
 
+	int16_t *local_blk;
+	int16_t *remote_blk = (int16_t*)ctrl_blk.decoded_data;
+	size_t size_temp;
+
 	for (uint32_t i = 0; i < NUM_BLKS_IN_FRAME; i++) {
+		ret = data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &local_blk, &size_temp, K_NO_WAIT);
+		ERR_CHK(ret);
+
+		filterFIR((int16_t*)remote_blk, local_blk, local_blk);
+		log_array(local_blk, remote_blk);
+
 		memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_STEREO_NUM_SAMPS],
 		       &((int16_t *)ctrl_blk.decoded_data)[i * BLK_STEREO_NUM_SAMPS],
 		       BLK_STEREO_SIZE_OCTETS);
@@ -868,6 +921,7 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 		ctrl_blk.out.prod_blk_ts[out_blk_idx] = recv_frame_ts_us + (i * BLK_PERIOD_US);
 
 		out_blk_idx = NEXT_IDX(out_blk_idx);
+		remote_blk = &((int16_t*)ctrl_blk.decoded_data)[i * BLK_STEREO_NUM_SAMPS];
 	}
 
 	ctrl_blk.out.prod_blk_idx = out_blk_idx;
@@ -919,6 +973,9 @@ int audio_datapath_init(void)
 	ctrl_blk.datapath_initialized = true;
 	ctrl_blk.drift_comp.hfclkaudio_comp_enabled = true;
 	ctrl_blk.pres_comp.pres_delay_us = DEFAULT_PRES_DLY_US;
+	LOG_WRN("init lms filter start");
+	InitFIRFilter();
+	LOG_WRN("init lms filter complete");
 
 	return 0;
 }
