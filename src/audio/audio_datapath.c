@@ -151,13 +151,15 @@ static struct {
 	} pres_comp;
 } ctrl_blk;
 
+static int8_t local_buf[BLOCK_SIZE_BYTES];
+
 static bool tone_active;
 /* Buffer which can hold max 1 period test tone at 100 Hz */
 static uint16_t test_tone_buf[CONFIG_AUDIO_SAMPLE_RATE_HZ / 100];
 static size_t test_tone_size;
 static int temp = 0;
 
-static void log_array(int16_t* ref, int16_t* out);
+static void log_array(char* name, int16_t* data);
 
 static void hfclkaudio_set(uint16_t freq_value)
 {
@@ -617,46 +619,6 @@ static void audio_datapath_i2s_blk_complete(uint32_t frame_start_ts, uint32_t *r
 		if (tone_active) {
 			tone_mix(tx_buf);
 		}
-
-		// TestLibrary(tx_buf, tx_buf, BLK_STEREO_SIZE_OCTETS);
-
-		/* 	
-			rx_buf: microphone I2S received samples, size = 96 bytes * 2 channels
-			Mono mic input is duplicated to both channels.
-		 	tx_buf: bluetooth received packet, size = 96 * 2. 
-		 	one channel is filled with zero. Data in two channels stored alternatively.
-		*/
-		// Test FIRFilter Design
-		// if (rx_buf_released != NULL){
-		// 	filterFIR(rx_buf_released, tx_buf, tx_buf);
-		// 	log_array(rx_buf_released, tx_buf);
-		// } else {
-		//  	int16_t* localSound;
-		//  	size_t size;
-		//  	data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &localSound, &size, K_NO_WAIT); 
-		// 	filterFIR(localSound, tx_buf, tx_buf);
-		// }
-		
-
-		// Mix remote sound with local mic input
-		// if (rx_buf_released != NULL){
-		// 	int i;
-		// 	uint16_t* temp = tx_buf;
-		// 	uint16_t* temp1 = rx_buf_released;
-		// 	for (i = 0; i < BLK_STEREO_SIZE_OCTETS/2; i++){	
-		// 		temp[i] += temp1[i];
-		// 	}
-		// }
-		// else {
-		//  	uint16_t* localSound;
-		//  	size_t size;
-		//  	data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &localSound, &size, K_NO_WAIT); 
-		// 	int i;
-		// 	uint16_t* temp = tx_buf;
-		// 	for (i = 0; i < BLK_STEREO_SIZE_OCTETS/2; i++){
-		// 		temp[i] += localSound[i];
-		// 	}
-		// }
 	}
 
 	/********** I2S RX **********/
@@ -667,7 +629,7 @@ static void audio_datapath_i2s_blk_complete(uint32_t frame_start_ts, uint32_t *r
 	if (rx_buf_released != NULL) {
 		ret = data_fifo_block_lock(ctrl_blk.in.fifo, (void **)&rx_buf_released,
 					   BLOCK_SIZE_BYTES);
-
+		memcpy(local_buf, rx_buf_released, BLOCK_SIZE_BYTES);
 		ERR_CHK_MSG(ret, "Unable to lock block RX");
 	}
 
@@ -706,14 +668,11 @@ static void audio_datapath_i2s_blk_complete(uint32_t frame_start_ts, uint32_t *r
 	audio_datapath_drift_compensation(frame_start_ts);
 }
 
-static void log_array(int16_t* ref, int16_t* out){
+static void log_array(char* name, int16_t* data){
 	temp++;
 	if (temp == 1000){
 		temp = 0;
-		int16_t* coef = getCoeffPtr(); 
-		LOG_WRN("input: %d %d %d %d %d %d %d %d\n", ref[0], ref[1], ref[2], ref[3], ref[4], ref[5], ref[6], ref[7]);
-		LOG_WRN("reference: %d %d %d %d %d %d %d %d\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
-		LOG_WRN("error: %d %d %d %d %d %d %d %d\n", coef[0], coef[1], coef[2], coef[3], coef[4], coef[5], coef[6], coef[7]);
+		LOG_WRN("%s: %d %d %d %d %d %d %d %d\n", name, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
 	}
 }
 
@@ -902,26 +861,23 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 
 	uint32_t out_blk_idx = ctrl_blk.out.prod_blk_idx;
 
-	int16_t *local_blk;
 	int16_t *remote_blk = (int16_t*)ctrl_blk.decoded_data;
-	size_t size_temp;
 
 	for (uint32_t i = 0; i < NUM_BLKS_IN_FRAME; i++) {
-		ret = data_fifo_pointer_last_filled_get(ctrl_blk.in.fifo, &local_blk, &size_temp, K_NO_WAIT);
-		ERR_CHK(ret);
-
-		filterFIR((int16_t*)remote_blk, local_blk, local_blk);
-		log_array(local_blk, remote_blk);
-
+		filterFIR((int16_t*)local_buf, remote_blk, remote_blk);
+		log_array("error", (int16_t *)getErrPtr());
 		memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_STEREO_NUM_SAMPS],
-		       &((int16_t *)ctrl_blk.decoded_data)[i * BLK_STEREO_NUM_SAMPS],
-		       BLK_STEREO_SIZE_OCTETS);
+		       remote_blk, BLK_STEREO_SIZE_OCTETS);
+
+		// memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_STEREO_NUM_SAMPS],
+		//        &((int16_t*)ctrl_blk.decoded_data)[i * BLK_STEREO_NUM_SAMPS],
+		// 	    BLK_STEREO_SIZE_OCTETS);
 
 		/* Record producer block start reference */
 		ctrl_blk.out.prod_blk_ts[out_blk_idx] = recv_frame_ts_us + (i * BLK_PERIOD_US);
 
 		out_blk_idx = NEXT_IDX(out_blk_idx);
-		remote_blk = &((int16_t*)ctrl_blk.decoded_data)[i * BLK_STEREO_NUM_SAMPS];
+		remote_blk = &((int16_t*)ctrl_blk.decoded_data)[(i+1) * BLK_STEREO_NUM_SAMPS];
 	}
 
 	ctrl_blk.out.prod_blk_idx = out_blk_idx;

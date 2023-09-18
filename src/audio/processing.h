@@ -7,5 +7,6 @@ void TestLibrary(uint8_t * decoded_input, uint8_t * processed_decoded_output, si
 void InitFIRFilter();
 void filterFIR(int16_t * input, int16_t* reference, int16_t* output);
 void* getCoeffPtr();
+void* getErrPtr();
 
 #endif
