@@ -865,7 +865,7 @@ void audio_datapath_stream_out(const uint8_t *buf, size_t size, uint32_t sdu_ref
 
 	for (uint32_t i = 0; i < NUM_BLKS_IN_FRAME; i++) {
 		filterFIR((int16_t*)local_buf, remote_blk, remote_blk);
-		log_array("error", (int16_t *)getErrPtr());
+		log_array("coef", (int16_t *)getCoeffPtr());
 		memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_STEREO_NUM_SAMPS],
 		       remote_blk, BLK_STEREO_SIZE_OCTETS);
 

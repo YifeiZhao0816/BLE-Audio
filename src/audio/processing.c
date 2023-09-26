@@ -17,10 +17,10 @@ static q15_t coeff_p[COEFFICIENT];
 
 //Initilize a FIR filter used for LMS filtering
 void InitFIRFilter(){
-    float32_t learningrate_float = 0.0005;
+    float32_t learningrate_float = 0.0002;
     q15_t learningrate;
     arm_float_to_q15(&learningrate_float, &learningrate, 1);
-    arm_lms_init_q15(&lms_instance, COEFFICIENT, coeff_p,  State, learningrate, MONO_BLOCK_SAMPLES, 0);
+    arm_lms_init_q15(&lms_instance, COEFFICIENT, coeff_p,  State, 0, MONO_BLOCK_SAMPLES, 0);
 }
 
 void filterFIR(int16_t* input, int16_t* reference, int16_t* output){
@@ -38,7 +38,8 @@ void filterFIR(int16_t* input, int16_t* reference, int16_t* output){
         reference_mono[i] = reference[2*i];
     }
 
-    arm_lms_q15(&lms_instance, input_mono, reference_mono, output_mono, errorArr, MONO_BLOCK_SAMPLES);
+    // arm_lms_q15(&lms_instance, input_mono, reference_mono, output_mono, errorArr, MONO_BLOCK_SAMPLES);
+    arm_lms_q15(&lms_instance, input_mono, input_mono, output_mono, errorArr, MONO_BLOCK_SAMPLES);
 
     for (i = 0; i < MONO_BLOCK_SAMPLES; i++){
         output[2*i] = output_mono[i];
